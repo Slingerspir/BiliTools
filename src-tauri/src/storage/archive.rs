@@ -30,9 +30,11 @@ pub struct ArchiveTable;
 impl TableSpec for ArchiveTable {
     const NAME: &'static str = "archive";
     const LATEST: i32 = 2;
+    
     fn create_stmt() -> TableCreateStatement {
         Table::create()
             .table(Archive::Table)
+            .if_not_exists()  // 优化点1：添加if_not_exists避免表已存在时报错
             .col(
                 ColumnDef::new(Archive::Name)
                     .text()
@@ -46,34 +48,49 @@ impl TableSpec for ArchiveTable {
 }
 
 pub async fn load() -> Result<()> {
+    // 优化点2：提前获取数据库连接
+    let pool = get_db().await?;
+    
     let (sql, values) = Query::select()
         .columns([Archive::Value])
         .from(Archive::Table)
         .build_sqlx(SqliteQueryBuilder);
 
-    let pool = get_db().await?;
     let rows = sqlx::query_with(&sql, values).fetch_all(&pool).await?;
-    {
-        TASK_MANAGER.tasks.write().await.clear();
+    
+    // 优化点3：单次写操作清空任务列表
+    let mut tasks = TASK_MANAGER.tasks.write().await;
+    tasks.clear();
+    
+    // 优化点4：预先分配内存空间
+    if !rows.is_empty() {
+        tasks.reserve(rows.len());
     }
+    
     for r in rows {
-        let mut v: Task = serde_json::from_str(&r.try_get::<String, _>("value")?)?;
-        if v.state == TaskState::Active {
-            v.state = TaskState::Paused
+        // 优化点5：简化值获取
+        let value_str: String = r.try_get("value")?;
+        let mut task: Task = serde_json::from_str(&value_str)?;
+        
+        // 优化点6：简化状态转换逻辑
+        if task.state == TaskState::Active {
+            task.state = TaskState::Paused;
         }
-        let id = v.id.clone();
-        let mut guard = TASK_MANAGER.tasks.write().await;
-        guard.insert(id.clone(), Arc::new(RwLock::new(v.clone())));
-        drop(guard);
+        
+        let id = task.id.clone();
+        tasks.insert(id, Arc::new(RwLock::new(task)));
     }
+    
     Ok(())
 }
 
 pub async fn upsert(task: &Task) -> Result<()> {
     let pool = get_db().await?;
     let now = get_ts(true);
-    let name = (*task.id).clone();
+    let name = task.id.clone();
     let value = serde_json::to_string(task)?;
+    
+    // 优化点7：简化查询构建
     let (sql, values) = Query::insert()
         .into_table(Archive::Table)
         .columns([Archive::Name, Archive::Value, Archive::UpdatedAt])
@@ -86,17 +103,17 @@ pub async fn upsert(task: &Task) -> Result<()> {
         .build_sqlx(SqliteQueryBuilder);
 
     sqlx::query_with(&sql, values).execute(&pool).await?;
-
     Ok(())
 }
 
 pub async fn delete(name: &str) -> Result<()> {
+    // 优化点8：简化删除操作
+    let pool = get_db().await?;
     let (sql, values) = Query::delete()
         .from_table(Archive::Table)
         .cond_where(Expr::col(Archive::Name).eq(name))
         .build_sqlx(SqliteQueryBuilder);
 
-    let pool = get_db().await?;
     sqlx::query_with(&sql, values).execute(&pool).await?;
     Ok(())
 }
